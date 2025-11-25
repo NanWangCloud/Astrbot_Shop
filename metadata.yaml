@@ -1,5 +1,5 @@
-name: "难忘云商场系统"
+name: "astrbot_plugin_nanwangcloud_shop"
 version: "1.2.0"
 description: "基于各发卡系统想出来的系统，未来将直接对接各发卡系统，无需独立设置！"
 author: "难忘云-任意"
-repository: "https://github.com/NanWangCloud/Astrbot_Shop"
+repo: "https://github.com/NanWangCloud/Astrbot_Shop"
