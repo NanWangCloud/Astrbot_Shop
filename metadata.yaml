@@ -1,5 +1,18 @@
-name: "astrbot_plugin_nanwangcloud_shop"
-version: "1.5.0"
-description: "基于各发卡系统想出来的系统，未来将直接对接各发卡系统，无需独立设置！"
-author: "难忘云-任意"
-repo: "https://github.com/NanWangCloud/Astrbot_Shop"
+name: astrbot_plugin_nanwangcloud_shop
+display_name: 难忘发卡
+author: 难忘云-任意
+version: 2.0.0
+description: 基于各发卡系统想出来的系统，未来将直接对接各发卡系统，无需独立设置！
+repository: https://github.com/NanWangCloud/Astrbot_Shop
+tags:
+  - 商城
+  - 支付
+  - 购物车
+  - 自动发货
+requirements:
+  - aiohttp>=3.9.0
+  - qrcode>=7.4.2
+  - pillow>=10.2.0
+  - python-dotenv>=1.0.0
+config_schema: _conf_schema.json
+min_astrbot_version: "3.4.36"  # 需支持会话控制、路由装饰器等新版功能
