@@ -1,4 +1,9 @@
-aiohttp>=3.8.0
-qrcode>=7.0
-Pillow>=10.0.0
-aiosmtplib>=2.0.0
+# 基础异步依赖
+aiohttp>=3.9.0
+# 二维码生成依赖
+qrcode>=7.4.2
+Pillow>=10.2.0
+# 数据序列化依赖
+python-dotenv>=1.0.0
+# JSON并发安全工具（AstrBot内置，若未内置需添加）
+# astrbot>=3.4.36
