@@ -112,31 +112,10 @@ class DataManager:
         try:
             if os.path.exists(filepath):
                 with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    # 转换日期字符串为datetime对象
-                    return self._convert_date_strings(data)
+                    return json.load(f)
         except Exception as e:
             logger.error(f"加载数据文件失败 {filepath}: {e}")
         return default
-
-    def _convert_date_strings(self, data):
-        """递归转换日期字符串为datetime对象"""
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, str):
-                    # 尝试解析ISO格式的日期字符串
-                    try:
-                        if len(value) >= 19 and 'T' in value:
-                            data[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                    except (ValueError, AttributeError):
-                        pass
-                elif isinstance(value, (dict, list)):
-                    data[key] = self._convert_date_strings(value)
-        elif isinstance(data, list):
-            for i, item in enumerate(data):
-                if isinstance(item, (dict, list)):
-                    data[i] = self._convert_date_strings(item)
-        return data
 
     def _save_data(self, filepath: str, data):
         try:
@@ -160,11 +139,16 @@ class DataManager:
 class EmailService:
     def __init__(self, config: Dict):
         self.config = config
+        # 检查邮箱配置是否完整
         self.enabled = all([
             config.get('smtp_host'),
             config.get('smtp_username'),
             config.get('smtp_password')
         ])
+        
+        # 设置默认值
+        self.smtp_port = config.get('smtp_port', 587)
+        self.from_name = config.get('from_name', '商城系统')
 
     async def send_email(self, to_email: str, subject: str, content: str) -> bool:
         if not self.enabled:
@@ -177,7 +161,7 @@ class EmailService:
             from email.mime.multipart import MIMEMultipart
 
             message = MIMEMultipart()
-            message['From'] = f"{self.config.get('from_name', '商城系统')} <{self.config['smtp_username']}>"
+            message['From'] = f"{self.from_name} <{self.config['smtp_username']}>"
             message['To'] = to_email
             message['Subject'] = subject
 
@@ -186,7 +170,7 @@ class EmailService:
             await aiosmtplib.send(
                 message,
                 hostname=self.config['smtp_host'],
-                port=self.config.get('smtp_port', 587),
+                port=self.smtp_port,
                 username=self.config['smtp_username'],
                 password=self.config['smtp_password'],
                 start_tls=True
@@ -358,7 +342,7 @@ class MallPlugin(Star):
                 for order_no, order_data in self.data_manager.orders.items():
                     if (order_data.get('status') == 'pending' and 
                         order_data.get('expire_time') and
-                        order_data['expire_time'] < current_time):
+                        datetime.fromisoformat(order_data['expire_time']) < current_time):
                         expired_orders.append(order_no)
                 
                 for order_no in expired_orders:
@@ -555,7 +539,6 @@ class MallPlugin(Star):
             return
         
         # 保存临时订单信息，用于下一步支付
-        temp_order_key = f"temp_order_{user_id}"
         self.temp_orders[user_id] = {
             'product_id': product_id,
             'product_name': product['name'],
@@ -799,7 +782,7 @@ class MallPlugin(Star):
         """通知管理员手动发货"""
         order_data = self.data_manager.orders[order_no]
         
-        # 获取管理员邮箱（从配置中读取或使用默认）
+        # 获取管理员邮箱（从配置中读取）
         admin_email = self.config.get('admin_email', 'admin@example.com')
         
         # 发送邮件通知管理员
@@ -846,7 +829,7 @@ class MallPlugin(Star):
         except Exception as e:
             logger.error(f"发送管理员通知失败: {e}")
 
-    # 简化的购物车功能
+    # 购物车功能
     @filter.command("cart_add")
     async def add_to_cart(self, event: AstrMessageEvent, product_id: str, quantity: int = 1):
         """添加商品到购物车"""
@@ -1355,12 +1338,6 @@ class MallPlugin(Star):
         # 这里先提供基本框架
         yield event.plain_result("数据恢复功能需要文件上传支持，请参考AstrBot文档实现文件上传处理")
 
-    # 插件版本检查
-    @filter.command("mall_version")
-    async def mall_version(self, event: AstrMessageEvent):
-        """查看插件版本"""
-        yield event.plain_result(f"🛍️ 商城插件版本: v{self.plugin_version}")
-
     # 系统状态检查
     @filter.command("mall_status")
     async def mall_status(self, event: AstrMessageEvent):
@@ -1488,6 +1465,94 @@ class MallPlugin(Star):
         
         yield event.plain_result(help_text)
 
+    # 插件版本检查
+    @filter.command("mall_version")
+    async def mall_version(self, event: AstrMessageEvent):
+        """查看插件版本"""
+        yield event.plain_result(f"🛍️ 商城插件版本: v{self.plugin_version}")
+
+    # 邮箱绑定功能
+    @filter.command("bind_email")
+    async def bind_email(self, event: AstrMessageEvent, email: str):
+        """绑定邮箱"""
+        user_id = event.get_sender_id()
+        
+        # 首先检查邮箱服务是否配置
+        if not self.email_service.enabled:
+            yield event.plain_result("❌ 邮箱服务未配置，请联系管理员配置邮箱服务")
+            return
+        
+        # 检查邮箱配置是否完整
+        email_config = self.config.get('email_config', {})
+        if not all([email_config.get('smtp_host'), 
+                   email_config.get('smtp_username'), 
+                   email_config.get('smtp_password')]):
+            yield event.plain_result("❌ 邮箱配置不完整，请联系管理员检查配置")
+            return
+        
+        # 生成验证码
+        verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        
+        # 保存验证码到临时状态字典
+        self.temp_orders[f"verify_{user_id}"] = {
+            'code': verification_code,
+            'email': email,
+            'expire_time': datetime.now() + timedelta(minutes=10)
+        }
+        
+        # 发送验证邮件
+        logger.info(f"尝试向 {email} 发送验证邮件")
+        success = await self.email_service.send_verification_code(email, verification_code)
+        
+        if success:
+            yield event.plain_result(f"✅ 验证码已发送到 {email}，请使用 /verify_email 验证码 完成绑定")
+        else:
+            # 清理临时数据
+            if f"verify_{user_id}" in self.temp_orders:
+                del self.temp_orders[f"verify_{user_id}"]
+            yield event.plain_result(
+                f"❌ 邮件发送失败\n"
+                f"可能的原因：\n"
+                f"1. 邮箱地址格式错误\n"
+                f"2. SMTP服务器配置错误\n"
+                f"3. 邮箱账号或密码错误\n"
+                f"4. 网络连接问题\n"
+                f"请检查邮箱配置或联系管理员"
+            )
+
+    @filter.command("verify_email")
+    async def verify_email(self, event: AstrMessageEvent, code: str):
+        """验证邮箱"""
+        user_id = event.get_sender_id()
+        verification_key = f"verify_{user_id}"
+        
+        verification_data = self.temp_orders.get(verification_key)
+        if not verification_data or verification_data['expire_time'] < datetime.now():
+            if verification_key in self.temp_orders:
+                del self.temp_orders[verification_key]
+            yield event.plain_result("验证码已过期，请重新绑定邮箱")
+            return
+        
+        if verification_data['code'] == code:
+            # 保存邮箱绑定
+            user_email = UserEmail(
+                user_id=user_id,
+                email=verification_data['email'],
+                verified=True,
+                verified_at=datetime.now()
+            )
+            
+            self.data_manager.user_emails[user_id] = asdict(user_email)
+            self.data_manager.save_user_emails()
+            
+            # 清理验证数据
+            if verification_key in self.temp_orders:
+                del self.temp_orders[verification_key]
+            
+            yield event.plain_result("✅ 邮箱绑定成功！")
+        else:
+            yield event.plain_result("❌ 验证码错误，请重新输入")
+
     # 会话控制示例：商品咨询
     @filter.command("consult")
     async def start_consultation(self, event: AstrMessageEvent, product_id: str = ""):
@@ -1531,85 +1596,12 @@ class MallPlugin(Star):
         finally:
             event.stop_event()
 
-# 邮箱绑定功能（保持原有功能）
-@filter.command("bind_email")
-async def bind_email(self, event: AstrMessageEvent, email: str):
-    """绑定邮箱"""
-    user_id = event.get_sender_id()
-    
-    # 首先检查邮箱服务是否配置
-    if not self.email_service.enabled:
-        yield event.plain_result("❌ 邮箱服务未配置，请联系管理员配置邮箱服务")
-        return
-    
-    # 检查邮箱配置是否完整
-    email_config = self.config.get('email_config', {})
-    if not all([email_config.get('smtp_host'), 
-               email_config.get('smtp_username'), 
-               email_config.get('smtp_password')]):
-        yield event.plain_result("❌ 邮箱配置不完整，请联系管理员检查配置")
-        return
-    
-    # 生成验证码
-    verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
-    
-    # 保存验证码到临时状态字典
-    user_id = event.get_sender_id()
-    self.temp_orders[f"verify_{user_id}"] = {
-        'code': verification_code,
-        'email': email,
-        'expire_time': datetime.now() + timedelta(minutes=10)
-    }
-    
-    # 发送验证邮件
-    logger.info(f"尝试向 {email} 发送验证邮件")
-    success = await self.email_service.send_verification_code(email, verification_code)
-    
-    if success:
-        yield event.plain_result(f"✅ 验证码已发送到 {email}，请使用 /verify_email 验证码 完成绑定")
-    else:
-        # 清理临时数据
-        if f"verify_{user_id}" in self.temp_orders:
-            del self.temp_orders[f"verify_{user_id}"]
-        yield event.plain_result(
-            f"❌ 邮件发送失败\n"
-            f"可能的原因：\n"
-            f"1. 邮箱地址格式错误\n"
-            f"2. SMTP服务器配置错误\n"
-            f"3. 邮箱账号或密码错误\n"
-            f"4. 网络连接问题\n"
-            f"请检查邮箱配置或联系管理员"
-        )
+# 初始化插件
+def main():
+    """插件入口点"""
+    # 这里可以添加插件初始化代码
+    pass
 
-@filter.command("verify_email")
-async def verify_email(self, event: AstrMessageEvent, code: str):
-    """验证邮箱"""
-    user_id = event.get_sender_id()
-    verification_key = f"verify_{user_id}"
-    
-    verification_data = self.temp_orders.get(verification_key)
-    if not verification_data or verification_data['expire_time'] < datetime.now():
-        if verification_key in self.temp_orders:
-            del self.temp_orders[verification_key]
-        yield event.plain_result("验证码已过期，请重新绑定邮箱")
-        return
-    
-    if verification_data['code'] == code:
-        # 保存邮箱绑定
-        user_email = UserEmail(
-            user_id=user_id,
-            email=verification_data['email'],
-            verified=True,
-            verified_at=datetime.now()
-        )
-        
-        self.data_manager.user_emails[user_id] = asdict(user_email)
-        self.data_manager.save_user_emails()
-        
-        # 清理验证数据
-        if verification_key in self.temp_orders:
-            del self.temp_orders[verification_key]
-        
-        yield event.plain_result("✅ 邮箱绑定成功！")
-    else:
-        yield event.plain_result("❌ 验证码错误，请重新输入")
+if __name__ == "__main__":
+    main()
+
