@@ -1,0 +1,68 @@
+{
+  "muyun_pay": {
+    "description": "支付配置",
+    "type": "object",
+    "items": {
+      "pid": {
+        "description": "商户ID",
+        "type": "string",
+        "hint": "在支付平台获取的商户ID"
+      },
+      "key": {
+        "description": "商户密钥",
+        "type": "string",
+        "hint": "在支付平台获取的商户密钥"
+      },
+      "api_url": {
+        "description": "支付接口地址",
+        "type": "string",
+        "default": "/xpay/epay/submit.php",
+        "hint": "支付接口地址"
+      }
+    }
+  },
+  "email_config": {
+    "description": "邮箱配置",
+    "type": "object",
+    "items": {
+      "smtp_host": {
+        "description": "SMTP服务器",
+        "type": "string",
+        "hint": "邮箱SMTP服务器地址"
+      },
+      "smtp_port": {
+        "description": "端口",
+        "type": "int",
+        "default": 587,
+        "hint": "SMTP端口"
+      },
+      "smtp_username": {
+        "description": "邮箱账号",
+        "type": "string",
+        "hint": "发件人邮箱地址"
+      },
+      "smtp_password": {
+        "description": "邮箱密码",
+        "type": "string",
+        "hint": "邮箱授权码或密码"
+      },
+      "from_name": {
+        "description": "发件人名称",
+        "type": "string",
+        "default": "商城系统",
+        "hint": "邮件中显示的发件人名称"
+      }
+    }
+  },
+  "payment_timeout": {
+    "description": "支付超时时间(秒)",
+    "type": "int",
+    "default": 60,
+    "hint": "用户支付超时时间，超过后订单自动取消"
+  },
+  "admin_email": {
+    "description": "管理员邮箱",
+    "type": "string",
+    "hint": "接收通知的管理员邮箱地址"
+  }
+}
