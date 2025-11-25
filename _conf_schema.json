@@ -1,80 +1,88 @@
 {
-  "muyun_pay": {
-    "description": "支付配置",
-    "type": "object",
-    "items": {
-      "pid": {
-        "description": "商户ID",
-        "type": "string",
-        "hint": "在支付平台获取的商户ID"
-      },
-      "key": {
-        "description": "商户密钥",
-        "type": "string",
-        "hint": "在支付平台获取的商户密钥"
-      },
-      "api_url": {
-        "description": "支付接口地址",
-        "type": "string",
-        "default": "/xpay/epay/submit.php",
-        "hint": "支付接口地址"
-      },
-      "base_url": {
-        "description": "支付回调基础URL",
-        "type": "string",
-        "default": "http://your-domain.com",
-        "hint": "支付回调通知和返回的基础URL"
-      }
-    }
-  },
   "email_config": {
-    "description": "邮箱配置",
+    "description": "邮箱服务配置（用于发送验证码/发货通知）",
     "type": "object",
+    "hint": "需配置SMTP服务，支持163邮箱、企业邮箱等",
     "items": {
       "smtp_host": {
-        "description": "SMTP服务器",
+        "description": "SMTP服务器地址",
         "type": "string",
-        "hint": "邮箱SMTP服务器地址"
-      },
-      "smtp_port": {
-        "description": "端口",
-        "type": "int",
-        "default": 587,
-        "hint": "SMTP端口"
+        "hint": "例：smtp.163.com（网易邮箱）",
+        "obvious_hint": true
       },
       "smtp_username": {
-        "description": "邮箱账号",
+        "description": "SMTP登录账号",
         "type": "string",
-        "hint": "发件人邮箱地址"
+        "hint": "通常为完整邮箱地址"
       },
       "smtp_password": {
-        "description": "邮箱密码",
+        "description": "SMTP授权码/密码",
         "type": "string",
-        "hint": "邮箱授权码或密码"
+        "hint": "163邮箱需开启SMTP服务并获取授权码，而非登录密码"
+      },
+      "smtp_port": {
+        "description": "SMTP端口",
+        "type": "int",
+        "default": 587,
+        "hint": "SSL端口通常为465，非SSL为587"
       },
       "from_name": {
         "description": "发件人名称",
         "type": "string",
-        "default": "商城系统",
-        "hint": "邮件中显示的发件人名称"
+        "default": "难忘发卡"
+      }
+    }
+  },
+  "muyun_pay": {
+    "description": "支付配置",
+    "type": "object",
+    "hint": "需在支付平台申请PID和密钥",
+    "items": {
+      "pid": {
+        "description": "商户ID",
+        "type": "string",
+        "hint": "从支付后台获取"
+      },
+      "key": {
+        "description": "支付密钥",
+        "type": "string",
+        "hint": "用于支付签名校验，请勿泄露"
+      },
+      "api_url": {
+        "description": "支付接口地址",
+        "type": "string",
+        "default": "https://pay.xxx.com/xpay/epay/submit.php"
+      },
+      "base_url": {
+        "description": "网站基础URL",
+        "type": "string",
+        "hint": "用于接收支付回调，例：https://your-domain.com"
       }
     }
   },
   "payment_timeout": {
-    "description": "支付超时时间(秒)",
+    "description": "支付超时时间（秒）",
     "type": "int",
-    "default": 60,
-    "hint": "用户支付超时时间，超过后订单自动取消"
-  },
-  "admin_email": {
-    "description": "管理员邮箱",
-    "type": "string",
-    "hint": "接收通知的管理员邮箱地址"
+    "default": 300,
+    "hint": "建议设置300-900秒（5-15分钟）"
   },
   "admin_ids": {
     "description": "管理员ID列表",
     "type": "list",
-    "default": [],
-    "hint": "接收机器人通知的管理员ID列表"
+    "hint": "填写机器人可识别的用户ID，多个ID用逗号分隔",
+    "items": {
+      "type": "string"
+    }
+  },
+  "admin_email": {
+    "description": "管理员通知邮箱",
+    "type": "string",
+    "default": "admin@astrbot-shop.com",
+    "hint": "接收手动发货通知、系统异常提醒"
+  },
+  "data_dir": {
+    "description": "数据存储目录",
+    "type": "string",
+    "hint": "默认使用插件默认数据目录，无需手动填写"
   }
 }
