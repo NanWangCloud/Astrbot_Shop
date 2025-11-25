@@ -18,6 +18,12 @@
         "type": "string",
         "default": "/xpay/epay/submit.php",
         "hint": "支付接口地址"
+      },
+      "base_url": {
+        "description": "支付回调基础URL",
+        "type": "string",
+        "default": "http://your-domain.com",
+        "hint": "支付回调通知和返回的基础URL"
       }
     }
   },
@@ -64,5 +70,11 @@
     "description": "管理员邮箱",
     "type": "string",
     "hint": "接收通知的管理员邮箱地址"
+  },
+  "admin_ids": {
+    "description": "管理员ID列表",
+    "type": "list",
+    "default": [],
+    "hint": "接收机器人通知的管理员ID列表"
   }
 }
