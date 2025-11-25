@@ -10,6 +10,7 @@ from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
+from collections import defaultdict
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
@@ -46,6 +47,7 @@ class Order:
     expire_time: datetime = None
     created_at: datetime = None
     paid_at: datetime = None
+    cart_items: Optional[List[Dict]] = None  # 购物车商品详情
 
 @dataclass
 class UserEmail:
@@ -110,10 +112,31 @@ class DataManager:
         try:
             if os.path.exists(filepath):
                 with open(filepath, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # 转换日期字符串为datetime对象
+                    return self._convert_date_strings(data)
         except Exception as e:
             logger.error(f"加载数据文件失败 {filepath}: {e}")
         return default
+
+    def _convert_date_strings(self, data):
+        """递归转换日期字符串为datetime对象"""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, str):
+                    # 尝试解析ISO格式的日期字符串
+                    try:
+                        if len(value) >= 19 and 'T' in value:
+                            data[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                    except (ValueError, AttributeError):
+                        pass
+                elif isinstance(value, (dict, list)):
+                    data[key] = self._convert_date_strings(value)
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                if isinstance(item, (dict, list)):
+                    data[i] = self._convert_date_strings(item)
+        return data
 
     def _save_data(self, filepath: str, data):
         try:
@@ -217,6 +240,7 @@ class PaymentService:
         self.pid = config.get('pid', '')
         self.key = config.get('key', '')
         self.api_url = config.get('api_url', '/xpay/epay/submit.php')
+        self.base_url = config.get('base_url', 'http://your-domain.com')  # 从配置读取
 
     def generate_sign(self, params: Dict) -> str:
         """生成支付签名"""
@@ -228,8 +252,12 @@ class PaymentService:
         return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
 
     async def create_payment(self, order_no: str, amount: float, product_name: str, 
-                           payment_method: str, notify_url: str, return_url: str) -> Dict[str, Any]:
+                           payment_method: str) -> Dict[str, Any]:
         """创建支付订单"""
+        # 使用配置中的base_url
+        notify_url = f"{self.base_url}/payment/notify"
+        return_url = f"{self.base_url}/payment/return"
+        
         params = {
             'pid': self.pid,
             'type': payment_method,  # 使用用户选择的支付方式
@@ -285,12 +313,19 @@ class PaymentService:
         img_buffer.seek(0)
         return img_buffer
 
-@register("mall", "商城系统", "完整的商城系统插件", "1.0.0")
+@register("mall", "商城系统", "完整的商城系统插件", "1.1.0")
 class MallPlugin(Star):
     def __init__(self, context: Context, config: Dict):
         super().__init__(context)
         self.config = config
-        self.data_dir = os.path.join("data", "mall_plugin")
+        
+        # 使用框架提供的工具获取数据目录
+        try:
+            from astrbot.api.star import StarTools
+            self.data_dir = StarTools.get_data_dir()
+        except ImportError:
+            # 回退方案
+            self.data_dir = os.path.join("data", "mall_plugin")
         
         # 初始化服务
         self.data_manager = DataManager(self.data_dir)
@@ -299,6 +334,15 @@ class MallPlugin(Star):
         
         # 支付超时时间
         self.payment_timeout = config.get('payment_timeout', 60)
+        
+        # 使用专用字典管理临时状态
+        self.temp_orders: Dict[str, Dict] = {}
+        
+        # 库存锁机制，防止竞态条件
+        self.product_locks = defaultdict(asyncio.Lock)
+        
+        # 插件版本
+        self.plugin_version = "1.1.0"
         
         # 启动定时任务清理过期订单
         asyncio.create_task(self._cleanup_expired_orders())
@@ -314,7 +358,7 @@ class MallPlugin(Star):
                 for order_no, order_data in self.data_manager.orders.items():
                     if (order_data.get('status') == 'pending' and 
                         order_data.get('expire_time') and
-                        datetime.fromisoformat(order_data['expire_time']) < current_time):
+                        order_data['expire_time'] < current_time):
                         expired_orders.append(order_no)
                 
                 for order_no in expired_orders:
@@ -484,14 +528,19 @@ class MallPlugin(Star):
             yield event.plain_result("商品已下架")
             return
         
-        if product['quantity'] < quantity:
-            yield event.plain_result(f"库存不足，当前库存：{product['quantity']}件")
-            return
-        
         if quantity <= 0:
             yield event.plain_result("购买数量必须大于0")
             return
         
+        # 使用锁机制检查库存，防止竞态条件
+        async with self.product_locks[product_id]:
+            if product['quantity'] < quantity:
+                yield event.plain_result(f"库存不足，当前库存：{product['quantity']}件")
+                return
+            
+            # 预扣库存（创建订单时预扣，支付成功后再实际扣减）
+            # 这里只是检查，不实际扣减
+            
         # 显示商品信息和支付方式选择
         amount = product['price'] * quantity
         
@@ -507,13 +556,13 @@ class MallPlugin(Star):
         
         # 保存临时订单信息，用于下一步支付
         temp_order_key = f"temp_order_{user_id}"
-        setattr(self, temp_order_key, {
+        self.temp_orders[user_id] = {
             'product_id': product_id,
             'product_name': product['name'],
             'quantity': quantity,
             'amount': amount,
             'expire_time': datetime.now() + timedelta(minutes=5)  # 5分钟内有效
-        })
+        }
         
         # 显示商品信息和支付方式选择
         product_info = f"🛒 确认购买信息：\n\n"
@@ -535,9 +584,11 @@ class MallPlugin(Star):
             user_choice = wait_event.message_str.strip()
             
             # 检查临时订单是否过期
-            temp_order = getattr(self, temp_order_key, None)
+            temp_order = self.temp_orders.get(user_id)
             if not temp_order or temp_order['expire_time'] < datetime.now():
                 await wait_event.send(wait_event.plain_result("订单已过期，请重新购买"))
+                if user_id in self.temp_orders:
+                    del self.temp_orders[user_id]
                 controller.stop()
                 return
             
@@ -551,6 +602,9 @@ class MallPlugin(Star):
                     await self._create_final_order(
                         wait_event, temp_order, method_id, method_name, user_id, user_email['email']
                     )
+                    # 清理临时订单
+                    if user_id in self.temp_orders:
+                        del self.temp_orders[user_id]
                     controller.stop()
                 else:
                     await wait_event.send(wait_event.plain_result(f"无效选择，请输入1-{len(available_methods)}之间的数字"))
@@ -563,17 +617,26 @@ class MallPlugin(Star):
             await payment_method_waiter(event)
         except TimeoutError:
             # 清理临时订单
-            if hasattr(self, temp_order_key):
-                delattr(self, temp_order_key)
+            if user_id in self.temp_orders:
+                del self.temp_orders[user_id]
             yield event.plain_result("支付方式选择超时，请重新购买")
         except Exception as e:
             logger.error(f"支付流程错误: {e}")
-            if hasattr(self, temp_order_key):
-                delattr(self, temp_order_key)
-            yield event.plain_result("购买过程发生错误，请    async def _create_final_order(self, event, temp_order, method_id, method_name, user_id, user_email):
+            # 清理临时订单
+            if user_id in self.temp_orders:
+                del self.temp_orders[user_id]
+            yield event.plain_result("购买过程发生错误，请稍后重试或联系管理员。")
+
+    async def _create_final_order(self, event, temp_order, method_id, method_name, user_id, user_email):
         """创建最终订单并生成支付"""
         product_id = temp_order['product_id']
-        product = self.data_manager.products[product_id]
+        
+        # 再次检查库存（双重检查）
+        async with self.product_locks[product_id]:
+            product = self.data_manager.products[product_id]
+            if product['quantity'] < temp_order['quantity']:
+                await event.send(event.plain_result(f"库存不足，当前库存：{product['quantity']}件"))
+                return
         
         # 创建订单
         order_no = f"ORD{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id[-4:]}"
@@ -583,7 +646,7 @@ class MallPlugin(Star):
             order_no=order_no,
             user_id=user_id,
             product_id=product_id,
-            product_name=product['name'],
+            product_name=temp_order['product_name'],
             quantity=temp_order['quantity'],
             amount=temp_order['amount'],
             status='pending',
@@ -598,10 +661,8 @@ class MallPlugin(Star):
         payment_result = await self.payment_service.create_payment(
             order_no=order_no,
             amount=temp_order['amount'],
-            product_name=product['name'],
-            payment_method=method_id,  # 使用用户选择的支付方式
-            notify_url=f"http://your-domain.com/payment/notify",
-            return_url=f"http://your-domain.com/payment/return"
+            product_name=temp_order['product_name'],
+            payment_method=method_id
         )
         
         if not payment_result['success']:
@@ -622,7 +683,7 @@ class MallPlugin(Star):
         # 发送支付信息
         await event.send(event.plain_result(
             f"💰 订单创建成功！\n"
-            f"📦 商品：{product['name']}\n"
+            f"📦 商品：{temp_order['product_name']}\n"
             f"📊 数量：{temp_order['quantity']}件\n"
             f"💰 金额：¥{temp_order['amount']}\n"
             f"💳 支付方式：{method_name}\n"
@@ -663,7 +724,7 @@ class MallPlugin(Star):
         
         # 更新订单状态
         order_data['status'] = 'paid'
-        order_data['paid_at'] = datetime.now().isoformat()
+        order_data['paid_at'] = datetime.now()
         self.data_manager.save_orders()
         
         # 根据发货类型处理
@@ -680,6 +741,19 @@ class MallPlugin(Star):
         """自动发货 - 使用管理员设置的自动发货内容"""
         order_data = self.data_manager.orders[order_no]
         product_id = order_data['product_id']
+        
+        # 使用锁机制确保库存扣减的原子性
+        async with self.product_locks[product_id]:
+            # 再次检查库存
+            if product_id in self.data_manager.products:
+                product = self.data_manager.products[product_id]
+                if product['quantity'] < order_data['quantity']:
+                    logger.error(f"库存不足，无法发货订单 {order_no}")
+                    return
+                
+                # 扣减库存
+                product['quantity'] -= order_data['quantity']
+                self.data_manager.save_products()
         
         # 获取自动发货内容
         if product_id in self.data_manager.products:
@@ -714,23 +788,9 @@ class MallPlugin(Star):
             ]
             await self.context.send_message(user_umo, message_chain)
         
-        # 记录发货日志
-        delivery_log = {
-            'order_id': order_no,
-            'delivery_type': 'auto',
-            'content': delivery_content,
-            'delivered_by': 'system',
-            'created_at': datetime.now().isoformat()
-        }
-        
-        # 更新库存
-        if product_id in self.data_manager.products:
-            self.data_manager.products[product_id]['quantity'] -= order_data['quantity']
-            self.data_manager.save_products()
-        
         # 更新订单状态为已发货
         order_data['status'] = 'delivered'
-        order_data['delivered_at'] = datetime.now().isoformat()
+        order_data['delivered_at'] = datetime.now()
         self.data_manager.save_orders()
         
         logger.info(f"订单 {order_no} 自动发货完成")
@@ -764,13 +824,29 @@ class MallPlugin(Star):
             f"请使用 /deliver_order {order_no} 发货内容 进行处理"
         )
         
-        # 这里需要获取管理员的会话标识，实际应用中可能需要从配置或数据库读取
-        # 暂时注释，需要根据实际情况实现
-        # admin_umo = "获取管理员的unified_msg_origin"
-        # if admin_umo:
-        #     await self.context.send_message(admin_umo, [Comp.Plain(text=admin_message)])
+        # 发送消息给管理员
+        await self._send_message_to_admin(admin_message)
 
-    # 简化的购物车功能（保持原有功能）
+    async def _send_message_to_admin(self, message: str):
+        """发送消息给管理员"""
+        try:
+            # 这里需要根据实际情况获取管理员的会话标识
+            # 示例：从配置中读取管理员ID
+            admin_ids = self.config.get('admin_ids', [])
+            
+            for admin_id in admin_ids:
+                try:
+                    # 使用AstrBot的API发送消息给管理员
+                    await self.context.send_message(
+                        admin_id, 
+                        [Comp.Plain(text=message)]
+                    )
+                except Exception as e:
+                    logger.error(f"发送消息给管理员 {admin_id} 失败: {e}")
+        except Exception as e:
+            logger.error(f"发送管理员通知失败: {e}")
+
+    # 简化的购物车功能
     @filter.command("cart_add")
     async def add_to_cart(self, event: AstrMessageEvent, product_id: str, quantity: int = 1):
         """添加商品到购物车"""
@@ -844,6 +920,38 @@ class MallPlugin(Star):
         
         yield event.plain_result(cart_content)
 
+    @filter.command("cart_remove")
+    async def remove_from_cart(self, event: AstrMessageEvent, index: int):
+        """从购物车移除商品"""
+        user_id = event.get_sender_id()
+        
+        if user_id not in self.data_manager.carts or not self.data_manager.carts[user_id]:
+            yield event.plain_result("❌ 购物车为空")
+            return
+        
+        if index < 1 or index > len(self.data_manager.carts[user_id]):
+            yield event.plain_result("❌ 商品序号无效")
+            return
+        
+        removed_item = self.data_manager.carts[user_id].pop(index - 1)
+        
+        # 如果购物车为空，删除整个购物车
+        if not self.data_manager.carts[user_id]:
+            del self.data_manager.carts[user_id]
+        
+        yield event.plain_result(f"✅ 已从购物车移除 {removed_item['name']}")
+
+    @filter.command("cart_clear")
+    async def clear_cart(self, event: AstrMessageEvent):
+        """清空购物车"""
+        user_id = event.get_sender_id()
+        
+        if user_id in self.data_manager.carts:
+            del self.data_manager.carts[user_id]
+            yield event.plain_result("✅ 购物车已清空")
+        else:
+            yield event.plain_result("🛒 购物车已经是空的")
+
     # 简化的购物车购买流程
     @filter.command("cart_buy")
     async def buy_cart(self, event: AstrMessageEvent):
@@ -906,29 +1014,25 @@ class MallPlugin(Star):
             user_email=user_email['email'],
             payment_method=method_name,
             expire_time=expire_time,
-            created_at=datetime.now()
+            created_at=datetime.now(),
+            cart_items=[
+                {
+                    'product_id': item['product_id'],
+                    'name': item['name'],
+                    'price': item['price'],
+                    'quantity': item['quantity'],
+                    'delivery_type': item['delivery_type']
+                }
+                for item in self.data_manager.carts[user_id]
+            ]
         )
-        
-        # 保存购物车商品详情
-        order.cart_items = [
-            {
-                'product_id': item['product_id'],
-                'name': item['name'],
-                'price': item['price'],
-                'quantity': item['quantity'],
-                'delivery_type': item['delivery_type']
-            }
-            for item in self.data_manager.carts[user_id]
-        ]
         
         # 生成支付信息
         payment_result = await self.payment_service.create_payment(
             order_no=order_no,
             amount=total_amount,
             product_name="购物车商品",
-            payment_method=method_id,
-            notify_url=f"http://your-domain.com/payment/notify",
-            return_url=f"http://your-domain.com/payment/return"
+            payment_method=method_id
         )
         
         if not payment_result['success']:
@@ -966,7 +1070,7 @@ class MallPlugin(Star):
         # 发送支付链接
         yield event.plain_result(f"支付链接：{payment_result['payment_url']}")
 
-    # 其他功能保持不变...
+    # 订单管理功能
     @filter.command("check_order")
     async def check_order(self, event: AstrMessageEvent, order_no: str = ""):
         """查看订单状态"""
@@ -1016,7 +1120,17 @@ class MallPlugin(Star):
                 yield event.plain_result("您还没有订单")
                 return
             
-            user_orders.sort(key=lambda x: x[1].get('created_at', ''), reverse=True)
+            # 修复排序逻辑：将字符串转换为datetime对象进行比较
+            user_orders.sort(
+                key=lambda x: (
+                    x[1].get('created_at') 
+                    if isinstance(x[1].get('created_at'), datetime)
+                    else datetime.fromisoformat(x[1]['created_at']) 
+                    if x[1].get('created_at') 
+                    else datetime.min
+                ), 
+                reverse=True
+            )
             
             order_list = "📋 您的订单：\n\n"
             for o_no, o_data in user_orders[:10]:  # 显示最近10个订单
@@ -1032,6 +1146,99 @@ class MallPlugin(Star):
             
             order_list += "\n使用 /check_order 订单号 查看详情"
             yield event.plain_result(order_list)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("order_list")
+    async def list_orders(self, event: AstrMessageEvent, status: str = "all", page: int = 1):
+        """管理员查看订单列表"""
+        page_size = 10
+        filtered_orders = []
+        
+        for order_no, order_data in self.data_manager.orders.items():
+            if status == "all" or order_data.get('status') == status:
+                filtered_orders.append((order_no, order_data))
+        
+        # 按创建时间倒序排列（修复排序逻辑）
+        filtered_orders.sort(
+            key=lambda x: (
+                x[1].get('created_at') 
+                if isinstance(x[1].get('created_at'), datetime)
+                else datetime.fromisoformat(x[1]['created_at']) 
+                if x[1].get('created_at') 
+                else datetime.min
+            ), 
+            reverse=True
+        )
+        
+        total_orders = len(filtered_orders)
+        total_pages = (total_orders + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_orders)
+        
+        if not filtered_orders:
+            yield event.plain_result("暂无订单")
+            return
+        
+        order_list = f"📋 订单列表 (第{page}/{total_pages}页)\n\n"
+        
+        status_map = {
+            'pending': '⏳待支付',
+            'paid': '✅已支付',
+            'delivered': '🚚已发货',
+            'cancelled': '❌已取消',
+            'expired': '💸已过期'
+        }
+        
+        for i in range(start_idx, end_idx):
+            order_no, order_data = filtered_orders[i]
+            status_text = status_map.get(order_data.get('status', 'unknown'), '❓未知')
+            
+            order_list += f"{i+1}. {order_no}\n"
+            order_list += f"   状态：{status_text}\n"
+            order_list += f"   商品：{order_data.get('product_name', 'N/A')}\n"
+            order_list += f"   金额：¥{order_data.get('amount', 0)}\n"
+            order_list += f"   用户：{order_data.get('user_id', '')}\n"
+            order_list += f"   时间：{order_data.get('created_at', '').strftime('%Y-%m-%d %H:%M:%S') if isinstance(order_data.get('created_at'), datetime) else order_data.get('created_at', '')[:19]}\n\n"
+        
+        order_list += f"共 {total_orders} 个订单\n"
+        if page < total_pages:
+            order_list += f"使用 /order_list {status} {page+1} 查看下一页"
+        
+        yield event.plain_result(order_list)
+
+    @filter.command("cancel_order")
+    async def cancel_order(self, event: AstrMessageEvent, order_no: str):
+        """取消订单"""
+        user_id = event.get_sender_id()
+        
+        if order_no not in self.data_manager.orders:
+            yield event.plain_result("订单不存在")
+            return
+        
+        order_data = self.data_manager.orders[order_no]
+        
+        # 检查权限：用户只能取消自己的订单，管理员可以取消任何订单
+        if order_data['user_id'] != user_id and not event.is_admin:
+            yield event.plain_result("无权操作此订单")
+            return
+        
+        if order_data['status'] not in ['pending']:
+            yield event.plain_result("只有待支付的订单可以取消")
+            return
+        
+        # 取消订单
+        order_data['status'] = 'cancelled'
+        order_data['cancelled_at'] = datetime.now()
+        order_data['cancelled_by'] = 'user' if order_data['user_id'] == user_id else 'admin'
+        
+        self.data_manager.save_orders()
+        
+        # 如果订单有支付监控任务，取消它
+        if order_no in self.data_manager.payment_monitors:
+            self.data_manager.payment_monitors[order_no].cancel()
+            del self.data_manager.payment_monitors[order_no]
+        
+        yield event.plain_result(f"✅ 订单 {order_no} 已取消")
 
     # 管理员发货功能
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1049,7 +1256,7 @@ class MallPlugin(Star):
         
         # 更新订单状态
         order_data['status'] = 'delivered'
-        order_data['delivered_at'] = datetime.now().isoformat()
+        order_data['delivered_at'] = datetime.now()
         self.data_manager.save_orders()
         
         # 发送邮件通知用户
@@ -1094,6 +1301,111 @@ class MallPlugin(Star):
             stats += f"  {method}: {count} 单\n"
         
         yield event.plain_result(stats)
+
+    # 数据备份和恢复功能
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("backup_data")
+    async def backup_data(self, event: AstrMessageEvent):
+        """备份数据"""
+        import shutil
+        import tempfile
+        import zipfile
+        
+        try:
+            # 创建临时备份目录
+            backup_dir = tempfile.mkdtemp()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = os.path.join(backup_dir, f"mall_backup_{timestamp}.zip")
+            
+            # 创建ZIP文件
+            with zipfile.ZipFile(backup_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # 备份所有数据文件
+                data_files = [
+                    "products.json",
+                    "orders.json", 
+                    "user_emails.json",
+                    "payment_methods.json"
+                ]
+                
+                for file in data_files:
+                    file_path = os.path.join(self.data_dir, file)
+                    if os.path.exists(file_path):
+                        zipf.write(file_path, file)
+            
+            # 读取备份文件内容
+            with open(backup_file, 'rb') as f:
+                backup_data = f.read()
+            
+            # 清理临时文件
+            shutil.rmtree(backup_dir)
+            
+            # 发送备份文件
+            yield event.file_result(backup_data, f"mall_backup_{timestamp}.zip")
+            yield event.plain_result("✅ 数据备份完成")
+            
+        except Exception as e:
+            logger.error(f"数据备份失败: {e}")
+            yield event.plain_result("❌ 数据备份失败")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("restore_data")
+    async def restore_data(self, event: AstrMessageEvent):
+        """恢复数据（需要上传备份文件）"""
+        # 这个功能需要处理文件上传，在AstrBot中可能需要特殊处理
+        # 这里先提供基本框架
+        yield event.plain_result("数据恢复功能需要文件上传支持，请参考AstrBot文档实现文件上传处理")
+
+    # 插件版本检查
+    @filter.command("mall_version")
+    async def mall_version(self, event: AstrMessageEvent):
+        """查看插件版本"""
+        yield event.plain_result(f"🛍️ 商城插件版本: v{self.plugin_version}")
+
+    # 系统状态检查
+    @filter.command("mall_status")
+    async def mall_status(self, event: AstrMessageEvent):
+        """检查系统状态"""
+        status_report = "🏪 商城系统状态\n\n"
+        
+        # 基本统计
+        total_products = len(self.data_manager.products)
+        total_orders = len(self.data_manager.orders)
+        total_users = len(self.data_manager.user_emails)
+        active_carts = len(self.data_manager.carts)
+        
+        # 订单状态统计
+        status_count = {'pending': 0, 'paid': 0, 'delivered': 0, 'cancelled': 0, 'expired': 0}
+        for order_data in self.data_manager.orders.values():
+            status = order_data.get('status', 'unknown')
+            if status in status_count:
+                status_count[status] += 1
+        
+        revenue = sum(order_data['amount'] for order_data in self.data_manager.orders.values() 
+                     if order_data.get('status') in ['paid', 'delivered'])
+        
+        status_report += f"📦 商品数量：{total_products}\n"
+        status_report += f"📋 订单总数：{total_orders}\n"
+        status_report += f"👥 注册用户：{total_users}\n"
+        status_report += f"🛒 活跃购物车：{active_carts}\n"
+        status_report += f"💰 总营业额：¥{revenue:.2f}\n\n"
+        
+        status_report += "📊 订单状态分布：\n"
+        status_report += f"⏳ 待支付：{status_count['pending']}\n"
+        status_report += f"✅ 已支付：{status_count['paid']}\n"
+        status_report += f"🚚 已发货：{status_count['delivered']}\n"
+        status_report += f"❌ 已取消：{status_count['cancelled']}\n"
+        status_report += f"💸 已过期：{status_count['expired']}\n\n"
+        
+        # 服务状态
+        email_status = "✅ 正常" if self.email_service.enabled else "❌ 未配置"
+        payment_status = "✅ 正常" if self.payment_service.pid else "❌ 未配置"
+        
+        status_report += f"📧 邮件服务：{email_status}\n"
+        status_report += f"💳 支付服务：{payment_status}\n"
+        status_report += f"⏰ 支付超时：{self.payment_timeout}秒\n"
+        status_report += f"🔒 库存锁数量：{len(self.product_locks)}"
+        
+        yield event.plain_result(status_report)
 
     async def terminate(self):
         """插件卸载时保存数据"""
@@ -1150,6 +1462,7 @@ class MallPlugin(Star):
 /check_order [订单号] - 查看订单
 /cancel_order <订单号> - 取消订单
 /mall_status - 查看系统状态
+/mall_version - 查看插件版本
 
 👑 管理员命令：
 /add_product <名称> <价格> <库存> [发货方式] [描述] [自动发货内容] - 添加商品
@@ -1170,8 +1483,133 @@ class MallPlugin(Star):
 3. 自动发货商品支付后立即发货
 4. 手动发货商品需要管理员处理
 5. 购买时可选择不同的支付方式
+6. 支持购物车批量购买
         """
         
         yield event.plain_result(help_text)
 
+    # 会话控制示例：商品咨询
+    @filter.command("consult")
+    async def start_consultation(self, event: AstrMessageEvent, product_id: str = ""):
+        """开始商品咨询"""
+        if product_id and product_id in self.data_manager.products:
+            product = self.data_manager.products[product_id]
+            yield event.plain_result(f"💬 开始咨询商品：{product['name']}\n请描述您的问题，输入'结束'退出咨询")
+        else:
+            yield event.plain_result("💬 开始客服咨询，请输入您的问题，输入'结束'退出咨询")
+        
+        @session_waiter(timeout=300, record_history_chains=False)  # 5分钟超时
+        async def consultation_waiter(controller: SessionController, consult_event: AstrMessageEvent):
+            user_message = consult_event.message_str
+            
+            if user_message.strip() in ['结束', '退出', 'end', 'quit']:
+                await consult_event.send(consult_event.plain_result("感谢您的咨询，再见！"))
+                controller.stop()
+                return
+            
+            # 这里可以接入客服系统或AI回复
+            # 简单示例：模拟客服回复
+            responses = [
+                "好的，我了解您的问题，请稍等为您查询...",
+                "这个问题我们需要进一步核实，请您耐心等待",
+                "感谢您的反馈，我们会尽快处理",
+                "请问您能提供更多详细信息吗？"
+            ]
+            import random
+            response = random.choice(responses)
+            
+            await consult_event.send(consult_event.plain_result(response))
+            controller.keep(timeout=300, reset_timeout=True)
+        
+        try:
+            await consultation_waiter(event)
+        except TimeoutError:
+            yield event.plain_result("咨询会话已超时结束")
+        except Exception as e:
+            logger.error(f"咨询会话异常: {e}")
+            yield event.plain_result("咨询过程发生错误")
+        finally:
+            event.stop_event()
+
+# 邮箱绑定功能（保持原有功能）
+@filter.command("bind_email")
+async def bind_email(self, event: AstrMessageEvent, email: str):
+    """绑定邮箱"""
+    user_id = event.get_sender_id()
     
+    # 首先检查邮箱服务是否配置
+    if not self.email_service.enabled:
+        yield event.plain_result("❌ 邮箱服务未配置，请联系管理员配置邮箱服务")
+        return
+    
+    # 检查邮箱配置是否完整
+    email_config = self.config.get('email_config', {})
+    if not all([email_config.get('smtp_host'), 
+               email_config.get('smtp_username'), 
+               email_config.get('smtp_password')]):
+        yield event.plain_result("❌ 邮箱配置不完整，请联系管理员检查配置")
+        return
+    
+    # 生成验证码
+    verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+    
+    # 保存验证码到临时状态字典
+    user_id = event.get_sender_id()
+    self.temp_orders[f"verify_{user_id}"] = {
+        'code': verification_code,
+        'email': email,
+        'expire_time': datetime.now() + timedelta(minutes=10)
+    }
+    
+    # 发送验证邮件
+    logger.info(f"尝试向 {email} 发送验证邮件")
+    success = await self.email_service.send_verification_code(email, verification_code)
+    
+    if success:
+        yield event.plain_result(f"✅ 验证码已发送到 {email}，请使用 /verify_email 验证码 完成绑定")
+    else:
+        # 清理临时数据
+        if f"verify_{user_id}" in self.temp_orders:
+            del self.temp_orders[f"verify_{user_id}"]
+        yield event.plain_result(
+            f"❌ 邮件发送失败\n"
+            f"可能的原因：\n"
+            f"1. 邮箱地址格式错误\n"
+            f"2. SMTP服务器配置错误\n"
+            f"3. 邮箱账号或密码错误\n"
+            f"4. 网络连接问题\n"
+            f"请检查邮箱配置或联系管理员"
+        )
+
+@filter.command("verify_email")
+async def verify_email(self, event: AstrMessageEvent, code: str):
+    """验证邮箱"""
+    user_id = event.get_sender_id()
+    verification_key = f"verify_{user_id}"
+    
+    verification_data = self.temp_orders.get(verification_key)
+    if not verification_data or verification_data['expire_time'] < datetime.now():
+        if verification_key in self.temp_orders:
+            del self.temp_orders[verification_key]
+        yield event.plain_result("验证码已过期，请重新绑定邮箱")
+        return
+    
+    if verification_data['code'] == code:
+        # 保存邮箱绑定
+        user_email = UserEmail(
+            user_id=user_id,
+            email=verification_data['email'],
+            verified=True,
+            verified_at=datetime.now()
+        )
+        
+        self.data_manager.user_emails[user_id] = asdict(user_email)
+        self.data_manager.save_user_emails()
+        
+        # 清理验证数据
+        if verification_key in self.temp_orders:
+            del self.temp_orders[verification_key]
+        
+        yield event.plain_result("✅ 邮箱绑定成功！")
+    else:
+        yield event.plain_result("❌ 验证码错误，请重新输入")
